@@ -29,10 +29,25 @@ async function fetchGitHubTree(repoFullName: string, token?: string) {
 
 export async function POST(req: Request) {
   try {
-    const { repoFullName } = await req.json().catch(() => ({ repoFullName: process.env.GITHUB_SYNC_REPO }));
+    const body = await req.json().catch(() => ({}));
+    let repos: string[] = [];
     
-    if (!repoFullName) {
-      return NextResponse.json({ error: 'repoFullName is required' }, { status: 400 });
+    if (body.repoFullName) {
+      repos = [body.repoFullName];
+    } else {
+      // データベースから取得
+      const { data: dbRepos } = await supabaseAdmin.from('repositories').select('repo_name');
+      if (dbRepos && dbRepos.length > 0) {
+        repos = dbRepos.map(r => r.repo_name);
+      } else {
+        // フォールバック: 環境変数
+        const reposStr = process.env.GITHUB_SYNC_REPOS || process.env.GITHUB_SYNC_REPO || '';
+        repos = reposStr.split(',').map(r => r.trim()).filter(Boolean);
+      }
+    }
+    
+    if (repos.length === 0) {
+      return NextResponse.json({ error: 'No repositories configured for sync' }, { status: 400 });
     }
 
     const githubToken = process.env.GITHUB_PAT;
@@ -44,48 +59,56 @@ export async function POST(req: Request) {
       headers['Authorization'] = `Bearer ${githubToken}`;
     }
 
-    const mdFiles = await fetchGitHubTree(repoFullName, githubToken);
-    if (!mdFiles) {
-      return NextResponse.json({ error: 'Failed to fetch repository tree' }, { status: 500 });
-    }
-
     const processed = [];
 
-    for (const fileItem of mdFiles) {
-      const filePath = fileItem.path;
-      // .cursorrules 等を除外（一応拡張子で絞ってはいるが）
-      if (filePath.includes('.cursorrules')) continue;
+    for (const repoFullName of repos) {
+      const mdFiles = await fetchGitHubTree(repoFullName, githubToken);
+      if (!mdFiles) {
+        console.error(`Failed to fetch tree for ${repoFullName}`);
+        continue;
+      }
 
-      const parts = filePath.split('/');
-      const projectName = parts.length > 1 ? parts[0] : 'root';
-      const fileName = parts[parts.length - 1];
+      for (const fileItem of mdFiles) {
+        const filePath = fileItem.path;
+        if (filePath.includes('.cursorrules')) continue;
 
-      const fileUrl = `https://api.github.com/repos/${repoFullName}/contents/${filePath}`;
-      const res = await fetch(fileUrl, { headers });
-      
-      if (!res.ok) continue;
+        const fileName = filePath.split('/').pop() || '';
+        const repoName = repoFullName.split('/')[1] || repoFullName;
+        const projectName = repoName; // プロジェクト名をリポジトリ名に
+        const uniqueFilePath = `${repoFullName}/${filePath}`; // 一意のファイルパス
 
-      const rawContent = await res.text();
-      const parsed = matter(rawContent);
-      
-      const status = parsed.data?.status || 'todo';
-      const priority = parsed.data?.priority || 'medium';
-      const title = parsed.data?.title || fileName.replace('.md', '');
-      const content = parsed.content || '';
+        const fileUrl = `https://api.github.com/repos/${repoFullName}/contents/${filePath}`;
+        const res = await fetch(fileUrl, { headers });
+        
+        if (!res.ok) continue;
 
-      const { error } = await supabaseAdmin
-        .from('tasks')
-        .upsert({
-          project_name: projectName,
-          file_path: filePath,
-          title,
-          status,
-          priority,
-          content,
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'file_path' });
+        const rawContent = await res.text();
+        const parsed = matter(rawContent);
+        
+        let defaultTitle = fileName.replace('.md', '');
+        if (defaultTitle.toUpperCase() === 'README') {
+          defaultTitle = repoName;
+        }
+        
+        const status = parsed.data?.status || 'todo';
+        const priority = parsed.data?.priority || 'medium';
+        const title = parsed.data?.title || defaultTitle;
+        const content = parsed.content || '';
 
-      if (!error) processed.push(filePath);
+        const { error } = await supabaseAdmin
+          .from('tasks')
+          .upsert({
+            project_name: projectName,
+            file_path: uniqueFilePath,
+            title,
+            status,
+            priority,
+            content,
+            updated_at: new Date().toISOString()
+          }, { onConflict: 'file_path' });
+
+        if (!error) processed.push(uniqueFilePath);
+      }
     }
 
     return NextResponse.json({ message: 'Sync completed', processedCount: processed.length, processed }, { status: 200 });

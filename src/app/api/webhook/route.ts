@@ -44,10 +44,10 @@ export async function POST(req: Request) {
 
     // 各ファイルをパースしてSupabaseへUpsert
     for (const filePath of Array.from(targetFiles)) {
-      const parts = filePath.split('/');
-      // project_name は最初のディレクトリ名（存在しない場合は 'root'）
-      const projectName = parts.length > 1 ? parts[0] : 'root';
-      const fileName = parts[parts.length - 1];
+      const fileName = filePath.split('/').pop() || '';
+      const repoName = repoFullName.split('/')[1] || repoFullName;
+      const projectName = repoName; // プロジェクト名をリポジトリ名に
+      const uniqueFilePath = `${repoFullName}/${filePath}`;
 
       // GitHub API から raw content を取得
       const fileUrl = `https://api.github.com/repos/${repoFullName}/contents/${filePath}`;
@@ -61,17 +61,22 @@ export async function POST(req: Request) {
       const rawContent = await res.text();
       const parsed = matter(rawContent);
       
+      let defaultTitle = fileName.replace('.md', '');
+      if (defaultTitle.toUpperCase() === 'README') {
+        defaultTitle = repoName;
+      }
+      
       // Frontmatterのフォールバック処理
       const status = parsed.data?.status || 'todo';
       const priority = parsed.data?.priority || 'medium';
-      const title = parsed.data?.title || fileName.replace('.md', '');
+      const title = parsed.data?.title || defaultTitle;
       const content = parsed.content || '';
 
       const { error } = await supabaseAdmin
         .from('tasks')
         .upsert({
           project_name: projectName,
-          file_path: filePath,
+          file_path: uniqueFilePath,
           title,
           status,
           priority,
